@@ -1,0 +1,11 @@
+# fsw example rules. Copy this file to rules.toml with `fsw edit`, then tailor
+# paths and commands to the current machine before enabling anything.
+
+[[watch]]
+name      = "list-incoming-images"
+path      = "~/Incoming"
+exts      = ["png", "jpg", "jpeg", "JPG"]
+events    = ["create", "rename", "modify"]
+recursive = false
+debounce  = "1s"
+command   = "ls -l {file}"

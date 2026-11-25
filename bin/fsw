@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# fsw — declarative file-watch manager built on watchexec.
+#
+# Rules live in a machine-local TOML registry. Each rule maps a directory +
+# file filter to a command. `fsw run` executes a rule in the foreground (the
+# npm-watch experience); `fsw enable` registers it under launchd (macOS) or
+# systemd --user (Linux) so it survives reboots and restarts on crash.
+#
+# Registry (default: ~/.config/fsw/rules.toml), override with $FSW_RULES:
+#
+#   [[watch]]
+#   name      = "optimize-incoming-images"
+#   path      = "~/Incoming"
+#   exts      = ["png", "jpg", "jpeg"]   # optional; no filter if omitted
+#   events    = ["create", "rename"]     # optional; default create,rename
+#   recursive = false                    # optional; default false
+#   debounce  = "1s"                     # optional; default "1s"
+#   ignore    = ["*/optimized/*"]        # optional; break handler feedback loops
+#   command   = "imageoptim {file}"      # {file} = absolute path of changed file
+
+RULES="${FSW_RULES:-${XDG_CONFIG_HOME:-$HOME/.config}/fsw/rules.toml}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fsw"
+
+info() { echo "info: $*" >&2; }
+warn() { echo "warning: $*" >&2; }
+die()  { echo "error: $*" >&2; exit 1; }
+
+# Absolute path to this script, so the launchd/systemd unit and the watchexec
+# child can re-invoke us regardless of the caller's PATH.
+resolve_self() {
+  local s="${BASH_SOURCE[0]}"
+  case "$s" in
+    */*) (cd "$(dirname "$s")" && printf '%s/%s\n' "$PWD" "$(basename "$s")") ;;
+    *)   command -v "$s" 2>/dev/null || printf '%s/.local/bin/fsw\n' "$HOME" ;;
+  esac
+}
+SELF="$(resolve_self)"
+
+need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
+
+require_rules() {
+  [[ -f "$RULES" ]] || die "no rules file at $RULES (run 'fsw edit' to create one)"
+}
+
+# Query the current rule (name in $RULE_NAME) via a yq expression. The name is
+# passed through the environment (strenv) so it is never spliced into the query.
+q() {
+  RULE_NAME="$name" yq -p toml -oy "$1" "$RULES" 2>/dev/null
+}
+
+rule_exists() {
+  [[ "$(q '.watch[] | select(.name == strenv(RULE_NAME)) | .name')" == "$name" ]]
+}
+
+# Load fields for the rule named in $name into globals. Applies defaults and
+# tilde-expansion (yq returns "~/x" literally; watchexec will not expand it).
+load_rule() {
+  rule_exists || die "no rule named '$name' in $RULES"
+  r_path="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | .path')"
+  r_cmd="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | .command')"
+  r_exts="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | (.exts // []) | join(",")')"
+  r_events="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | (.events // ["create","rename"]) | join(",")')"
+  r_debounce="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | (.debounce // "1s")')"
+  r_recursive="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | (.recursive // false)')"
+  # ignore globs, newline-separated
+  r_ignore="$(q '.watch[] | select(.name == strenv(RULE_NAME)) | (.ignore // [])[]')"
+
+  [[ -n "$r_path" && "$r_path" != "null" ]] || die "rule '$name' has no path"
+  [[ -n "$r_cmd"  && "$r_cmd"  != "null" ]] || die "rule '$name' has no command"
+  r_path="${r_path/#\~/$HOME}"
+}
+
+# ---- subcommands ----------------------------------------------------------
+
+cmd_list() {
+  require_rules
+  need yq
+  local n
+  n="$(yq -p toml -oy '.watch | length' "$RULES" 2>/dev/null || echo 0)"
+  if [[ -z "$n" || "$n" -eq 0 ]]; then
+    info "no rules defined in $RULES"
+    return 0
+  fi
+
+  if command -v nu >/dev/null 2>&1; then
+    # nushell renders the table. Under `-c` it does not consume piped stdin,
+    # so we let it pull the JSON itself via run-external (`^`). FSW_RULES is
+    # forwarded so the child sees the same registry.
+    FSW_RULES="$RULES" nu -c "^'$SELF' __list-json | from json | select name state path command"
+  else
+    warn "nushell (nu) not found; using plain output"
+    local i p c state
+    { printf 'NAME\tSTATE\tPATH\tCOMMAND\n'
+      for ((i = 0; i < n; i++)); do
+        name="$(yq -p toml -oy ".watch[$i].name" "$RULES")"
+        p="$(yq -p toml -oy ".watch[$i].path" "$RULES")"
+        c="$(yq -p toml -oy ".watch[$i].command" "$RULES")"
+        if is_enabled; then state="enabled"; else state="off"; fi
+        printf '%s\t%s\t%s\t%s\n' "$name" "$state" "$p" "$c"
+      done
+    } | column -t -s $'\t'
+  fi
+}
+
+# Internal: emit the rule registry as a compact JSON array. State is computed
+# in bash (OS-aware, via is_enabled); string fields come from yq so escaping is
+# correct. Consumed by `fsw list` through nushell's run-external.
+cmd_list_json() {
+  require_rules
+  need yq
+  local n i state objs=()
+  n="$(yq -p toml -oy '.watch | length' "$RULES" 2>/dev/null || echo 0)"
+  for ((i = 0; i < n; i++)); do
+    name="$(yq -p toml -oy ".watch[$i].name" "$RULES")"
+    if is_enabled; then state="enabled"; else state="off"; fi
+    objs+=("$(STATE="$state" yq -p toml -o=json -I=0 \
+      ".watch[$i] | {\"name\": .name, \"state\": strenv(STATE), \"path\": .path, \"command\": .command}" \
+      "$RULES" 2>/dev/null)")
+  done
+  printf '[%s]' "$(IFS=,; printf '%s' "${objs[*]}")"
+}
+
+cmd_run() {
+  name="${1:-}"; [[ -n "$name" ]] || die "usage: fsw run <name>"
+  require_rules; need yq; need watchexec
+  load_rule
+
+  local -a args=()
+  if [[ "$r_recursive" == "true" ]]; then args+=(-w "$r_path"); else args+=(-W "$r_path"); fi
+  [[ -n "$r_exts" && "$r_exts" != "null" ]] && args+=(--exts "$r_exts")
+  args+=(--fs-events "$r_events")
+  args+=(--debounce "$r_debounce")
+  args+=(--emit-events-to=stdio)
+  args+=(--on-busy-update=queue)
+  args+=(--postpone)
+  args+=(--no-vcs-ignore --no-project-ignore)
+  while IFS= read -r glob; do
+    [[ -n "$glob" && "$glob" != "null" ]] && args+=(--ignore "$glob")
+  done <<<"$r_ignore"
+  args+=(--shell=none)
+
+  info "watching $r_path (exts=${r_exts:-*} events=$r_events) -> $r_cmd"
+  exec watchexec "${args[@]}" -- "$SELF" __dispatch "$name"
+}
+
+# Internal: consume watchexec stdio events and run the rule command per path.
+# The path is passed as a positional arg ("$1"), never spliced into the command
+# string, so filenames with spaces/quotes/$ cannot break out.
+cmd_dispatch() {
+  name="${1:-}"; [[ -n "$name" ]] || die "usage: fsw __dispatch <name>"
+  require_rules; need yq
+  load_rule
+  # {file} -> "$1"  (the replacement text is literal; bash does not expand $ here)
+  local snippet="${r_cmd//\{file\}/\"\$1\"}"
+  local evt path
+  while IFS= read -r evt; do
+    path="${evt#*:}"            # strip "create:" / "rename:" / ... prefix
+    [[ -n "$path" ]] || continue
+    [[ -e "$path" ]] || continue   # file was removed/renamed away; skip
+    sh -c "$snippet" fsw-handler "$path" || warn "handler failed for: $path"
+  done
+}
+
+# ---- supervision (macOS launchd / Linux systemd --user) -------------------
+
+os_kind() { case "$(uname -s)" in Darwin) echo darwin;; Linux) echo linux;; *) echo other;; esac; }
+launchd_label() { echo "com.fsw.$name"; }
+launchd_plist() { echo "$HOME/Library/LaunchAgents/$(launchd_label).plist"; }
+systemd_unit()  { echo "$HOME/.config/systemd/user/fsw-$name.service"; }
+
+is_enabled() {
+  case "$(os_kind)" in
+    darwin) [[ -f "$(launchd_plist)" ]] ;;
+    linux)  [[ -f "$(systemd_unit)" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+write_launchd_plist() {
+  local plist; plist="$(launchd_plist)"
+  mkdir -p "$(dirname "$plist")" "$STATE_DIR"
+  cat >"$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(launchd_label)</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SELF</string>
+    <string>run</string>
+    <string>$name</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>FSW_RULES</key><string>$RULES</string>
+  </dict>
+  <key>StandardOutPath</key><string>$STATE_DIR/$name.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/$name.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+cmd_enable() {
+  name="${1:-}"; [[ -n "$name" ]] || die "usage: fsw enable <name>"
+  require_rules; need yq; need watchexec
+  load_rule
+  case "$(os_kind)" in
+    darwin)
+      write_launchd_plist
+      launchctl bootout "gui/$(id -u)/$(launchd_label)" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$(launchd_plist)"
+      info "enabled '$name' (launchd: $(launchd_label)); log: $STATE_DIR/$name.log"
+      ;;
+    linux)
+      local unit; unit="$(systemd_unit)"
+      mkdir -p "$(dirname "$unit")"
+      cat >"$unit" <<UNIT
+[Unit]
+Description=fsw watch: $name
+[Service]
+ExecStart=$SELF run $name
+Environment=FSW_RULES=$RULES
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=default.target
+UNIT
+      systemctl --user daemon-reload
+      systemctl --user enable --now "fsw-$name.service"
+      info "enabled '$name' (systemd --user: fsw-$name.service)"
+      ;;
+    *) die "unsupported OS for supervision: $(uname -s)" ;;
+  esac
+}
+
+cmd_disable() {
+  name="${1:-}"; [[ -n "$name" ]] || die "usage: fsw disable <name>"
+  case "$(os_kind)" in
+    darwin)
+      launchctl bootout "gui/$(id -u)/$(launchd_label)" 2>/dev/null || true
+      rm -f "$(launchd_plist)"
+      info "disabled '$name'"
+      ;;
+    linux)
+      systemctl --user disable --now "fsw-$name.service" 2>/dev/null || true
+      rm -f "$(systemd_unit)"
+      systemctl --user daemon-reload
+      info "disabled '$name'"
+      ;;
+    *) die "unsupported OS: $(uname -s)" ;;
+  esac
+}
+
+cmd_status() {
+  name="${1:-}"
+  case "$(os_kind)" in
+    darwin)
+      if [[ -n "$name" ]]; then
+        launchctl print "gui/$(id -u)/$(launchd_label)" 2>/dev/null \
+          | /usr/bin/grep -E 'state|pid|program' || info "'$name' is not loaded"
+      else
+        launchctl list 2>/dev/null | /usr/bin/grep -E 'PID|com\.fsw\.' || info "no fsw agents loaded"
+      fi
+      ;;
+    linux)
+      if [[ -n "$name" ]]; then systemctl --user status "fsw-$name.service" --no-pager || true
+      else systemctl --user list-units 'fsw-*.service' --no-pager || true; fi
+      ;;
+    *) die "unsupported OS: $(uname -s)" ;;
+  esac
+}
+
+cmd_edit() {
+  mkdir -p "$(dirname "$RULES")"
+  if [[ ! -e "$RULES" ]]; then
+    local example="${RULES%.toml}.example.toml"
+    [[ -f "$example" ]] || example="$(dirname "$SELF")/../share/fsw/rules.example.toml"
+    if [[ -f "$example" ]]; then
+      cp "$example" "$RULES"
+      info "created local registry from $example"
+    else
+      printf 'watch = []\n' > "$RULES"
+      info "created empty local registry at $RULES"
+    fi
+  fi
+  "${EDITOR:-nvim}" "$RULES"
+}
+
+cmd_doctor() {
+  local status=0
+  echo "rules: $RULES"
+  [[ -f "$RULES" ]] && echo "  present" || { warn "  missing"; status=1; }
+  for t in watchexec yq; do
+    if command -v "$t" >/dev/null 2>&1; then echo "tool: $t ok"; else warn "tool: $t missing"; status=1; fi
+  done
+  if [[ -f "$RULES" ]]; then
+    if yq -p toml -oy '.watch | length' "$RULES" >/dev/null 2>&1; then
+      echo "parse: ok ($(yq -p toml -oy '.watch | length' "$RULES") rules)"
+    else
+      warn "parse: rules.toml does not parse as TOML"; status=1
+    fi
+  fi
+  echo "os: $(os_kind)"
+  return "$status"
+}
+
+print_help() {
+  cat <<'EOF'
+usage:
+  fsw list                 List rules and whether each is enabled.
+  fsw run <name>           Run a rule in the foreground (npm-watch style).
+  fsw enable <name>        Supervise a rule (launchd on macOS, systemd --user on Linux).
+  fsw disable <name>       Stop and unregister a supervised rule.
+  fsw status [name]        Show supervision state.
+  fsw edit                 Create/edit the machine-local rules registry.
+  fsw doctor               Check tools and that the registry parses.
+
+Registry: ~/.config/fsw/rules.toml  (machine-local; override with $FSW_RULES)
+EOF
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  list)      cmd_list "$@" ;;
+  __list-json) cmd_list_json "$@" ;;
+  run)       cmd_run "$@" ;;
+  __dispatch) cmd_dispatch "$@" ;;
+  enable)    cmd_enable "$@" ;;
+  disable)   cmd_disable "$@" ;;
+  status)    cmd_status "$@" ;;
+  edit)      cmd_edit "$@" ;;
+  doctor)    cmd_doctor "$@" ;;
+  -h|--help|help|"") print_help ;;
+  *) print_help >&2; exit 2 ;;
+esac
